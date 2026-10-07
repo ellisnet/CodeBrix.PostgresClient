@@ -1,0 +1,260 @@
+namespace CodeBrix.PostgresClient; //was previously: Npgsql;
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+// .NET docs on metric instrumentation: https://learn.microsoft.com/en-us/dotnet/core/diagnostics/metrics-instrumentation
+// OpenTelemetry semantic conventions for database metric: https://opentelemetry.io/docs/specs/semconv/database/database-metrics
+sealed class MetricsReporter : IDisposable
+{
+    const string Version = "0.1.0";
+
+    static readonly Meter Meter;
+
+    static readonly UpDownCounter<int> CommandsExecuting;
+    static readonly Counter<int> CommandsFailed;
+    static readonly Histogram<double> CommandDuration;
+
+    static readonly Counter<long> BytesWritten;
+    static readonly Counter<long> BytesRead;
+
+    static readonly UpDownCounter<int> PendingConnectionRequests;
+    static readonly Counter<int> ConnectionTimeouts;
+    static readonly Histogram<double> ConnectionCreateTime;
+    static readonly ObservableGauge<double> PreparedRatio;
+
+    readonly PgSqlDataSource _dataSource;
+
+    readonly KeyValuePair<string, object> _poolNameTag;
+    readonly TagList _durationMetricTags;
+
+    static readonly List<MetricsReporter> Reporters = [];
+
+    static readonly InstrumentAdvice<double> ShortHistogramAdvice = new()
+    {
+        HistogramBucketBoundaries = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
+    };
+
+    CommandCounters _commandCounters;
+
+    [StructLayout(LayoutKind.Explicit)]
+    struct CommandCounters
+    {
+        [FieldOffset(0)] internal int CommandsStarted;
+        [FieldOffset(4)] internal int PreparedCommandsStarted;
+        [FieldOffset(0)] internal long All;
+    }
+
+    static MetricsReporter()
+    {
+        Meter = new("PgSql", Version);
+
+        // db.client.operation.duration is stable in the OpenTelemetry spec
+        CommandDuration = Meter.CreateHistogram<double>(
+            "db.client.operation.duration",
+            unit: "s",
+            description: "Duration of database client operations.",
+            advice: ShortHistogramAdvice);
+
+        // From here, metrics have "development" status (not stable)
+        Meter.CreateObservableUpDownCounter(
+            "db.client.connection.count",
+            GetConnectionCount,
+            unit: "{connection}",
+            description: "The number of connections that are currently in state described by the state attribute.");
+
+        // It's a bit ridiculous to manage "max connections" as an observable counter, given that it never changes for a given pool.
+        // However, we can't simply report it once at startup, since clients who connect later wouldn't have it. And since reporting it
+        // repeatedly isn't possible because we need to provide incremental figures, we just manage it as an observable counter.
+        Meter.CreateObservableUpDownCounter(
+            "db.client.connection.max",
+            GetConnectionMax,
+            unit: "{connection}",
+            description: "The maximum number of open connections allowed.");
+
+        // From here, metrics are entirely CodeBrix.PostgresClient-specific and not covered by the OpenTelemetry spec.
+        CommandsExecuting = Meter.CreateUpDownCounter<int>(
+            "db.client.operation.pgsql.executing",
+            unit: "{command}",
+            description: "The number of currently executing database commands.");
+
+        CommandsFailed = Meter.CreateCounter<int>(
+            "db.client.operation.failed",
+            unit: "{command}",
+            description: "The number of database commands which have failed.");
+
+        BytesWritten = Meter.CreateCounter<long>(
+            "db.client.operation.pgsql.bytes_written",
+            unit: "By",
+            description: "The number of bytes written.");
+
+        BytesRead = Meter.CreateCounter<long>(
+            "db.client.operation.pgsql.bytes_read",
+            unit: "By",
+            description: "The number of bytes read.");
+
+        PendingConnectionRequests = Meter.CreateUpDownCounter<int>(
+            "db.client.connection.pgsql.pending_requests",
+            unit: "{request}",
+            description: "The number of pending requests for an open connection, cumulative for the entire pool.");
+
+        ConnectionTimeouts = Meter.CreateCounter<int>(
+            "db.client.connection.pgsql.timeouts",
+            unit: "{timeout}",
+            description: "The number of connection timeouts that have occurred trying to obtain a connection from the pool.");
+
+        ConnectionCreateTime = Meter.CreateHistogram<double>(
+            "db.client.connection.pgsql.create_time",
+            unit: "s",
+            description: "The time it took to create a new connection.",
+            advice: ShortHistogramAdvice);
+
+        PreparedRatio = Meter.CreateObservableGauge(
+            "db.client.operation.pgsql.prepared_ratio",
+            GetPreparedCommandsRatio,
+            description: "The ratio of prepared command executions.");
+    }
+
+    public MetricsReporter(PgSqlDataSource dataSource)
+    {
+        _dataSource = dataSource;
+        _poolNameTag = new KeyValuePair<string, object>("db.client.connection.pool.name", dataSource.Name);
+
+        _durationMetricTags = new TagList
+        {
+            // TODO: Vary this for PG-like databases (e.g. CockroachDB)?
+            { "db.system.name", "postgresql" },
+            { "db.client.connection.pool.name", _dataSource.Name },
+            { "server.address", _dataSource.Settings.Host },
+            { "server.port", _dataSource.Settings.Port }
+        };
+
+        lock (Reporters)
+        {
+            Reporters.Add(this);
+            Reporters.Sort((x,y) => string.Compare(x._dataSource.Name, y._dataSource.Name, StringComparison.Ordinal));
+        }
+    }
+
+    internal long ReportCommandStart()
+    {
+        CommandsExecuting.Add(1, _poolNameTag);
+        if (PreparedRatio.Enabled)
+            Interlocked.Increment(ref _commandCounters.CommandsStarted);
+
+        return CommandDuration.Enabled ? Stopwatch.GetTimestamp() : 0;
+    }
+
+    internal void ReportCommandStop(long startTimestamp)
+    {
+        CommandsExecuting.Add(-1, _poolNameTag);
+
+        if (CommandDuration.Enabled && startTimestamp > 0)
+        {
+            CommandDuration.Record(Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, _durationMetricTags);
+        }
+    }
+
+    internal void CommandStartPrepared()
+    {
+        if (PreparedRatio.Enabled)
+            Interlocked.Increment(ref _commandCounters.PreparedCommandsStarted);
+    }
+
+    internal void ReportCommandFailed() => CommandsFailed.Add(1, _poolNameTag);
+
+    internal void ReportBytesWritten(long bytesWritten) => BytesWritten.Add(bytesWritten, _poolNameTag);
+    internal void ReportBytesRead(long bytesRead) => BytesRead.Add(bytesRead, _poolNameTag);
+
+    internal void ReportConnectionPoolTimeout()
+        => ConnectionTimeouts.Add(1, _poolNameTag);
+
+    internal void ReportPendingConnectionRequestStart()
+        => PendingConnectionRequests.Add(1, _poolNameTag);
+    internal void ReportPendingConnectionRequestStop()
+        => PendingConnectionRequests.Add(-1, _poolNameTag);
+
+    internal void ReportConnectionCreateTime(TimeSpan duration)
+        => ConnectionCreateTime.Record(duration.TotalSeconds, _poolNameTag);
+
+    static IEnumerable<Measurement<int>> GetConnectionCount()
+    {
+        lock (Reporters)
+        {
+            var measurements = new List<Measurement<int>>();
+
+            for (var i = 0; i < Reporters.Count; i++)
+            {
+                var reporter = Reporters[i];
+
+                var connectionStats = reporter._dataSource.Statistics;
+                measurements.Add(new Measurement<int>(
+                    connectionStats.Idle,
+                    reporter._poolNameTag,
+                    new KeyValuePair<string, object>("db.client.connection.state", "idle")));
+
+                measurements.Add(new Measurement<int>(
+                    connectionStats.Busy,
+                    reporter._poolNameTag,
+                    new KeyValuePair<string, object>("db.client.connection.state", "used")));
+            }
+
+            return measurements;
+        }
+    }
+
+    static IEnumerable<Measurement<int>> GetConnectionMax()
+    {
+        lock (Reporters)
+        {
+            var measurements = new List<Measurement<int>>();
+
+            foreach (var reporter in Reporters)
+            {
+                if (reporter._dataSource is PoolingDataSource poolingDataSource)
+                {
+                    measurements.Add(new Measurement<int>(poolingDataSource.MaxConnections, reporter._poolNameTag));
+                }
+            }
+
+            return measurements;
+        }
+    }
+
+    static IEnumerable<Measurement<double>> GetPreparedCommandsRatio()
+    {
+        lock (Reporters)
+        {
+            var measurements = new List<Measurement<double>>(Reporters.Count);
+
+            for (var i = 0; i < Reporters.Count; i++)
+            {
+                var reporter = Reporters[i];
+
+                var counters = new CommandCounters
+                {
+                    All = Interlocked.Exchange(ref reporter._commandCounters.All, default)
+                };
+
+                var value = (double)counters.PreparedCommandsStarted / counters.CommandsStarted * 100;
+
+                if (double.IsFinite(value))
+                    measurements.Add(new Measurement<double>(value, reporter._poolNameTag));
+            }
+
+            return measurements;
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (Reporters)
+        {
+            Reporters.Remove(this);
+        }
+    }
+}

@@ -1,0 +1,281 @@
+using System;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+
+namespace CodeBrix.PostgresClient.Internal.Postgres; //was previously: Npgsql.Internal.Postgres;
+
+/// <summary>
+/// Represents the normalized name of a PostgreSQL data type.
+/// </summary>
+[Experimental(PgSqlDiagnostics.ConvertersExperimental)]
+[DebuggerDisplay("{DisplayName,nq}")]
+public readonly struct DataTypeName : IEquatable<DataTypeName>
+{
+    const char InvalidIdentifier = '-';
+
+    /// <summary>
+    /// The maximum length of names in an unmodified PostgreSQL installation.
+    /// </summary>
+    /// <remarks>
+    /// We need to respect this to get to valid names when deriving them (for multirange/arrays etc).
+    /// This does not include the namespace.
+    /// </remarks>
+    internal const int NAMEDATALEN = 64 - 1; // Minus null terminator.
+
+    readonly string _value;
+
+    DataTypeName(string fullyQualifiedDataTypeName, bool validated)
+    {
+        if (!validated)
+        {
+            var schemaEndIndex = fullyQualifiedDataTypeName.IndexOf('.');
+            if (schemaEndIndex is -1 or 0)
+                throw new ArgumentException("Given value does not contain a schema.", nameof(fullyQualifiedDataTypeName));
+
+            // Friendly array syntax is the only fully qualified name quirk that's allowed by postgres (see FromDisplayName).
+            if (fullyQualifiedDataTypeName.AsSpan(schemaEndIndex).EndsWith("[]".AsSpan()))
+                fullyQualifiedDataTypeName = NormalizeName(fullyQualifiedDataTypeName);
+
+            var typeNameLength = fullyQualifiedDataTypeName.Length - (schemaEndIndex + 1);
+            if (typeNameLength > NAMEDATALEN)
+                throw new ArgumentException(
+                    $"Name is too long and would be truncated to: {fullyQualifiedDataTypeName.Substring(0,
+                        fullyQualifiedDataTypeName.Length - typeNameLength + NAMEDATALEN)}");
+        }
+
+        _value = fullyQualifiedDataTypeName;
+    }
+
+    /// <summary>Creates a data type name from a fully qualified <c>schema.name</c> string; the friendly <c>name[]</c> array syntax is normalized to <c>_name</c>.</summary>
+    /// <param name="fullyQualifiedDataTypeName">The schema-qualified type name.</param>
+    /// <exception cref="ArgumentException">The name has no schema, or the type name exceeds PostgreSQL's identifier length limit.</exception>
+    public DataTypeName(string fullyQualifiedDataTypeName)
+        : this(fullyQualifiedDataTypeName, validated: false) { }
+
+    internal static DataTypeName ValidatedName(string fullyQualifiedDataTypeName)
+        => new(fullyQualifiedDataTypeName, validated: true);
+
+    bool IsUnqualifiedDisplayName => SchemaSpan is "pg_catalog" || IsUnqualified;
+
+    // Includes schema unless it's pg_catalog or the schema is an invalid character used to represent an unspecified schema.
+    /// <summary>The human-readable name, e.g. <c>integer</c> or <c>myschema.mytype[]</c>; the schema is omitted for <c>pg_catalog</c> and unqualified names, and SQL standard aliases are used for built-in types.</summary>
+    public string DisplayName =>
+        IsUnqualifiedDisplayName
+            ? UnqualifiedDisplayName
+            : Schema + "." + UnqualifiedDisplayName;
+
+    /// <summary>The human-readable name without the schema, using SQL standard aliases for <c>pg_catalog</c> types and the <c>[]</c> suffix for arrays.</summary>
+    public string UnqualifiedDisplayName => ToDisplayName(UnqualifiedNameSpan, mapAliases: IsUnqualifiedDisplayName);
+
+    internal ReadOnlySpan<char> SchemaSpan => Value.AsSpan(0, _value.IndexOf('.'));
+    /// <summary>The schema part of the name (the part before the first '.').</summary>
+    public string Schema => Value.Substring(0, _value.IndexOf('.'));
+    internal ReadOnlySpan<char> UnqualifiedNameSpan => Value.AsSpan(_value.IndexOf('.') + 1);
+    /// <summary>The type name without the schema, as stored in <c>pg_type.typname</c> (arrays carry a leading '_').</summary>
+    public string UnqualifiedName => Value.Substring(_value.IndexOf('.') + 1);
+    /// <summary>The full <c>schema.name</c> string; throws <see cref="InvalidOperationException"/> on a default instance.</summary>
+    public string Value => _value is null ? ThrowDefaultException() : _value;
+
+    static string ThrowDefaultException() =>
+        throw new InvalidOperationException($"This operation cannot be performed on a default value of {nameof(DataTypeName)}.");
+
+    /// <summary>Returns the fully qualified name string (<see cref="Value"/>).</summary>
+    /// <param name="value">The data type name.</param>
+    public static implicit operator string(DataTypeName value) => value.Value;
+
+    // This contains two invalid sql identifiers (schema and name are both separate identifiers, and would both have to be quoted to be valid).
+    // Given this is an invalid name it's fine for us to represent a fully qualified 'unspecified' name with it.
+    static string UnspecifiedName => $"{InvalidIdentifier}.{InvalidIdentifier}";
+    /// <summary>A placeholder name representing a type that has not been specified.</summary>
+    public static DataTypeName Unspecified => ValidatedName(UnspecifiedName);
+
+    /// <summary>Strips the schema from a possibly qualified type name.</summary>
+    /// <param name="dataTypeName">A type name, with or without a schema.</param>
+    /// <returns>The part after the first '.', or the input if it has no schema.</returns>
+    public static string GetUnqualifiedName(string dataTypeName)
+        => dataTypeName.IndexOf('.') is not -1 and var index
+            ? dataTypeName.Substring(index + 1) : dataTypeName;
+
+    /// <summary>Whether this name was created without a schema (its schema is the placeholder for "unspecified").</summary>
+    public bool IsUnqualified => Value.StartsWith(InvalidIdentifier) && Value != UnspecifiedName;
+
+    /// <summary>Whether this is the name of an array type (its unqualified name starts with '_').</summary>
+    public bool IsArray => UnqualifiedNameSpan.StartsWith("_".AsSpan(), StringComparison.Ordinal);
+
+    internal static DataTypeName CreateFullyQualifiedName(string dataTypeName)
+        => dataTypeName.IndexOf('.') != -1 ? new(dataTypeName) : new("-." + dataTypeName);
+
+    // Static transform as defined by https://www.postgresql.org/docs/current/sql-createtype.html#SQL-CREATETYPE-ARRAY
+    // We don't have to deal with [] as we're always starting from a normalized fully qualified name.
+    /// <summary>Returns the name of the array type for this type, following PostgreSQL's convention of prefixing '_' and truncating to the identifier length limit; array names are returned unchanged.</summary>
+    /// <returns>The array type name.</returns>
+    public DataTypeName ToArrayName()
+    {
+        var unqualifiedNameSpan = UnqualifiedNameSpan;
+        if (unqualifiedNameSpan.StartsWith("_".AsSpan(), StringComparison.Ordinal))
+            return this;
+
+        if (unqualifiedNameSpan.Length + "_".Length > NAMEDATALEN)
+            unqualifiedNameSpan = unqualifiedNameSpan.Slice(0, NAMEDATALEN - "_".Length);
+
+        return new(string.Concat(Schema, "._", unqualifiedNameSpan));
+    }
+
+    // Static transform as defined by https://www.postgresql.org/docs/current/sql-createtype.html#SQL-CREATETYPE-RANGE
+    // Manual testing on PG confirmed it's only the first occurence of 'range' that gets replaced.
+    /// <summary>Returns the name of the default multirange type for this range type, following PostgreSQL's naming rules (replacing the first <c>range</c> with <c>multirange</c>, or else appending <c>_multirange</c>).</summary>
+    /// <returns>The multirange type name.</returns>
+    public DataTypeName ToDefaultMultirangeName()
+    {
+        var nameSpan = UnqualifiedNameSpan;
+        if (nameSpan.IndexOf("multirange".AsSpan(), StringComparison.Ordinal) is not -1)
+            return this;
+
+        if (nameSpan.IndexOf("range", StringComparison.Ordinal) is var rangeIndex and not -1)
+        {
+            nameSpan = string.Concat(nameSpan.Slice(0, rangeIndex), "multirange", nameSpan.Slice(rangeIndex + "range".Length));
+            return new(string.Concat(SchemaSpan, ".",
+                nameSpan.Length > NAMEDATALEN ? nameSpan.Slice(0, NAMEDATALEN) : nameSpan));
+        }
+
+        if (nameSpan.Length + "_multirange".Length > NAMEDATALEN)
+            nameSpan = nameSpan.Slice(0, NAMEDATALEN - "_multirange".Length);
+
+        return new(string.Concat(SchemaSpan, ".", nameSpan, "_multirange"));
+    }
+
+    // Create a DataTypeName from a broader range of valid names.
+    // including SQL aliases like 'timestamp without time zone', trailing facet info etc.
+    /// <summary>Parses a name as written in SQL, accepting SQL standard aliases (e.g. <c>integer</c>, <c>timestamp with time zone</c>), <c>[]</c> array syntax and type modifiers, and maps it to the canonical name.</summary>
+    /// <param name="displayName">The name to parse; unqualified well-known names are placed in <c>pg_catalog</c>.</param>
+    /// <returns>The canonical data type name.</returns>
+    public static DataTypeName FromDisplayName(string displayName)
+    {
+        var displayNameSpan = displayName.AsSpan().Trim();
+
+        var schemaEndIndex = displayNameSpan.IndexOf('.');
+        ReadOnlySpan<char> schemaSpan;
+        if (schemaEndIndex is not -1)
+        {
+            schemaSpan = displayNameSpan.Slice(0, schemaEndIndex);
+            displayNameSpan = displayNameSpan.Slice(schemaEndIndex + 1);
+        }
+        else
+        {
+            schemaSpan = $"{InvalidIdentifier}";
+        }
+
+        // Then we strip either of the two valid array representations to get the base type name (with or without facets).
+        var isArray = false;
+        if (displayNameSpan.StartsWith("_", StringComparison.Ordinal))
+        {
+            isArray = true;
+            displayNameSpan = displayNameSpan.Slice(1);
+        }
+        else if (displayNameSpan.EndsWith("[]", StringComparison.Ordinal))
+        {
+            isArray = true;
+            displayNameSpan = displayNameSpan.Slice(0, displayNameSpan.Length - 2);
+        }
+
+        if (schemaEndIndex is not -1)
+        {
+            // If we have a schema we're done, Postgres doesn't do display name conversions on fully qualified names.
+            // There is one exception and that's array syntax, which is always resolvable in both ways, while we want the canonical name.
+            return !isArray
+                ? new(displayName.Length == schemaEndIndex + displayNameSpan.Length
+                    ? displayName
+                    : string.Concat(schemaSpan, ".", displayNameSpan))
+                : new(string.Concat(schemaSpan, ".", "_", displayNameSpan));
+        }
+
+        // Finally we strip the facet info.
+        var parenIndex = displayNameSpan.IndexOf('(');
+        if (parenIndex > -1)
+            displayNameSpan = displayNameSpan.Slice(0, parenIndex);
+
+        // Map any aliases to the internal type name.
+        var mapped = displayNameSpan switch
+        {
+            "boolean" => "bool",
+            "character" => "bpchar",
+            "decimal" => "numeric",
+            "real" => "float4",
+            "double precision" => "float8",
+            "smallint" => "int2",
+            "integer" => "int4",
+            "bigint" => "int8",
+            "time without time zone" => "time",
+            "timestamp without time zone" => "timestamp",
+            "time with time zone" => "timetz",
+            "timestamp with time zone" => "timestamptz",
+            "bit varying" => "varbit",
+            "character varying" => "varchar",
+            var value => value
+        };
+
+        if (DataTypeNames.IsWellKnownUnqualifiedName(mapped))
+            schemaSpan = "pg_catalog".AsSpan();
+
+        return new(string.Concat(schemaSpan, ".", isArray ? "_" : "", mapped));
+    }
+
+    // The type names stored in a DataTypeName are usually the actual typname from the pg_type column.
+    // There are some canonical aliases defined in the SQL standard which we take into account.
+    // Additionally array types have a '_' prefix while for readability their element type should be postfixed with '[]'.
+    // See the table for all the aliases https://www.postgresql.org/docs/current/static/datatype.html#DATATYPE-TABLE
+    // Alternatively some of the source lives at https://github.com/postgres/postgres/blob/c8e1ba736b2b9e8c98d37a5b77c4ed31baf94147/src/backend/utils/adt/format_type.c#L186
+    static string ToDisplayName(ReadOnlySpan<char> unqualifiedName, bool mapAliases)
+    {
+        var isArray = unqualifiedName.IndexOf('_') is 0;
+        var baseTypeName = isArray ? unqualifiedName.Slice(1) : unqualifiedName;
+
+        string mappedBaseType = null;
+        if (mapAliases)
+        {
+            mappedBaseType = baseTypeName switch
+            {
+                "bool" => "boolean",
+                "bpchar" => "character",
+                "decimal" => "numeric",
+                "float4" => "real",
+                "float8" => "double precision",
+                "int2" => "smallint",
+                "int4" => "integer",
+                "int8" => "bigint",
+                "time" => "time without time zone",
+                "timestamp" => "timestamp without time zone",
+                "timetz" => "time with time zone",
+                "timestamptz" => "timestamp with time zone",
+                "varbit" => "bit varying",
+                "varchar" => "character varying",
+                _ => null
+            };
+        }
+
+        return isArray
+            ? string.Concat(mappedBaseType ?? baseTypeName, "[]")
+            : mappedBaseType ?? baseTypeName.ToString();
+    }
+
+    internal static bool IsFullyQualified(ReadOnlySpan<char> dataTypeName) => dataTypeName.Contains(".".AsSpan(), StringComparison.Ordinal);
+
+    internal static string NormalizeName(string dataTypeName)
+    {
+        var fqName = FromDisplayName(dataTypeName);
+        return IsFullyQualified(dataTypeName.AsSpan()) ? fqName.Value : fqName.UnqualifiedName;
+    }
+
+    /// <summary>Returns the fully qualified name string (<see cref="Value"/>).</summary>
+    public override string ToString() => Value;
+    /// <inheritdoc />
+    public bool Equals(DataTypeName other) => string.Equals(_value, other._value);
+    /// <inheritdoc />
+    public override bool Equals(object obj) => obj is DataTypeName other && Equals(other);
+    /// <inheritdoc />
+    public override int GetHashCode() => _value.GetHashCode();
+    /// <summary>Determines whether two names are the same fully qualified name (ordinal comparison).</summary>
+    public static bool operator ==(DataTypeName left, DataTypeName right) => left.Equals(right);
+    /// <summary>Determines whether two names differ.</summary>
+    public static bool operator !=(DataTypeName left, DataTypeName right) => !left.Equals(right);
+}

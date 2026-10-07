@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The same narrow [Experimental] opt-in the library project carries (see the comment there):
+         NPG9001 / NPG9002 / NPG9003 are the library's own experimental API gates, which the
+         converter, database-info and DbType-resolver tests exercise on purpose.
+         CS0618 (use of an [Obsolete] member) is allowed here and ONLY here, by Jeremy's decision
+         (2026-10-07): several tests deliberately exercise obsolete-but-still-shipped APIs
+         (GlobalTypeMapper, PgSqlLargeObjectManager, PgSqlTsVector.Parse / PgSqlTsQuery.Parse,
+         PgSqlDataReader.Statements, ...) so that they keep working until they are removed. The
+         library project itself builds with zero CS0618. -->
+    <NoWarn>$(NoWarn);NPG9001;NPG9002;NPG9003;CS0618</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CodeBrix.PostgresClient\CodeBrix.PostgresClient.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+    <PackageReference Include="SilverAssertions.ApacheLicenseForever" Version="1.0.248.1071" />
+    <PackageReference Include="CodeBrix.Docker.MitLicenseForever" Version="1.0.259.361" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Test-only SSL certificates for the PostgreSQL test container (see Support/TestDatabase.cs). -->
+    <None Include="Certificates\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

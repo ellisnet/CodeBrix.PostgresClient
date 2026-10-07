@@ -1,0 +1,166 @@
+THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
+
+CodeBrix.PostgresClient is a fully managed ADO.NET data provider for
+PostgreSQL. It is a port: essentially all of its provider source code is
+derived from the Npgsql project, which is licensed under the PostgreSQL
+License. That project is recorded below with its origin, the version ported
+from, the copyright holders, the full text of its license, and the
+modifications made during the port. A second entry records the design lineage
+of the PgSqlMapper API, which contains no third-party code.
+
+The CodeBrix.PostgresClient project itself is licensed to you by Jeremy Ellis
+and contributors under the terms set forth in the LICENSE file at the root of
+this repository. That license is the PostgreSQL License - the same license as
+the upstream project - and it carries the upstream copyright notice alongside
+the CodeBrix one, as the upstream license requires.
+
+If you have any questions about any third-party code or services referenced
+here, or if you believe that any third-party code has been included in
+CodeBrix.PostgresClient in error, please open a new issue at:
+https://github.com/ellisnet/CodeBrix.PostgresClient/issues
+
+================================================================================
+1. Npgsql
+================================================================================
+
+Project:      Npgsql - the .NET data provider for PostgreSQL
+Source:       https://github.com/npgsql/npgsql
+Ported from:  branch hotfix/10.0.4, commit
+              5f0773cc6eb01f7b28d2879bb6539002dd2f358d - that is release tag
+              v10.0.3 (commit d3768398c17877b3a916c3c4d87e8e11698991fc) plus
+              the commits made on top of it for the next patch release: a
+              version bump, a template-engine package bump (not applicable
+              here), and a fix requesting mutual authentication for SSPI
+              authentication negotiation.
+Authors:      Shay Rojansky, Nikita Kazmin, Brar Piening, Nino Floris,
+              Yoh Deadfall, Austin Drenski, Emil Lenngren,
+              Francisco Figueiredo Jr., Kenji Uno, and the Npgsql contributors
+Copyright:    Copyright (c) 2002-2025, Npgsql
+License:      PostgreSQL License (SPDX: PostgreSQL)
+
+Ported source (production):
+    src/Npgsql/**                       -> src/CodeBrix.PostgresClient/**
+    src/Npgsql.SourceGenerators/**      -> src/CodeBrix.PostgresClient.SourceGenerators/**
+
+Ported source and files (tests):
+    test/Npgsql.Tests/**                -> tests/CodeBrix.PostgresClient.Tests/**
+    .build/ca.crt, .build/server.crt, .build/server.key
+                                        -> tests/CodeBrix.PostgresClient.Tests/Certificates/
+                                           (test-only SSL certificates, used by
+                                           the PostgreSQL test container)
+
+Not ported: the plugin projects (Npgsql.GeoJSON, Npgsql.Json.NET,
+Npgsql.NetTopologySuite, Npgsql.NodaTime, Npgsql.OpenTelemetry), the
+benchmarks, the NativeAOT and specification test projects, and the build
+tooling.
+
+Modifications made during the port:
+  * The root namespace Npgsql was renamed to CodeBrix.PostgresClient (and every
+    namespace beneath it accordingly), and NpgsqlTypes was renamed to
+    CodeBrix.PostgresClient.PgSqlTypes. Every ported file records its origin on
+    its namespace line as "//was previously: <original namespace>;".
+  * Every identifier containing "Npgsql" was renamed to use "PgSql" instead
+    (NpgsqlConnection -> PgSqlConnection, NpgsqlDbType -> PgSqlDbType,
+    INpgsqlNameTranslator -> IPgSqlNameTranslator, and so on), and the source
+    files were renamed to match.
+  * Runtime-visible names were renamed the same way: the ActivitySource and
+    Meter ("PgSql"), the EventSources ("PgSql" and "PgSql.Sql"), the logger
+    categories ("PgSql.Connection", "PgSql.Command", ...), the AppContext
+    switches ("PgSql.EnableLegacyTimestampBehavior", ...), the tracing and
+    metric attribute names ("db.pgsql.*", "db.client.*.pgsql.*"), the schema
+    DataSourceProductName, and "Npgsql" in exception and log message text.
+    URLs pointing at the upstream documentation were left unchanged.
+  * The diagnostic IDs of the [Experimental] API gates (NPG9001, NPG9002,
+    NPG9003) were NOT renamed: an ID is a public contract, written into
+    consumers' NoWarn entries and suppressions.
+  * Conditional-compilation branches for frameworks other than .NET 10 were
+    resolved and removed; #if DEBUG blocks were kept.
+  * Block-scoped namespaces were converted to file-scoped namespaces, and
+    using directives were normalized into one sorted block.
+  * Nullable reference type annotations were removed (every "?" on a reference
+    type and every "!" null-forgiving operator), following the CodeBrix
+    family convention; value-type nullables are unchanged.
+  * All "#pragma warning" suppressions and the GlobalSuppressions.cs file were
+    removed. XML documentation was written for every public member that
+    upstream left undocumented.
+  * Strong-name signing, the public-API analyzer and the dependency on
+    Microsoft.Extensions.DependencyInjection.Abstractions (unused by the
+    provider code) were dropped. The upstream InternalsVisibleTo entries were
+    replaced by one for this repository's test project.
+  * Members that were already [Obsolete] upstream and that the provider itself
+    still used were removed: the PgSqlCidr type (use System.Net.IPNetwork for
+    cidr), the PgSqlConnection.ProvidePasswordCallback,
+    ProvideClientCertificatesCallback and UserCertificateValidationCallback
+    properties with their delegate types (use the data source builder's
+    password providers and SSL callbacks), and the TrustServerCertificate and
+    InternalCommandTimeout connection-string keywords (both did nothing).
+    The tests of those members were removed with them.
+  * The ServerCompatibilityMode and LoadTableComposites connection-string
+    keywords were kept but are no longer marked [Obsolete]: they are the only
+    way to configure type loading from a plain connection string (for example
+    for servers that cannot answer the type-loading catalog queries).
+  * Log messages: every value a log message passes as a structured argument
+    now also appears in the message text (for example "Completed keepalive
+    (connector 12)"), and the connection string is no longer passed to the
+    logger at all - upstream passed it, with the password removed, as an
+    unreferenced structured argument on the connection open/close events.
+  * The connection-string-builder source generator renders its template with
+    the CodeBrix.Templating library instead of the template engine upstream
+    uses. The generator is a build-time tool and is not shipped in the
+    package.
+  * The library's reflection-based additions (PgSqlMapper, below) are marked
+    [RequiresUnreferencedCode] / [RequiresDynamicCode].
+  * Tests: the NUnit test suite was converted to xUnit v3 and SilverAssertions.
+    The OpenTelemetry-based tracing and metrics tests were rewritten to use the
+    in-box System.Diagnostics ActivityListener and MeterListener. The test
+    database is a throw-away PostgreSQL Docker container configured like the
+    upstream CI server, and the test users were renamed from npgsql_tests* to
+    pgsql_tests*.
+
+License text (reproduced from the upstream LICENSE file):
+
+    Copyright (c) 2002-2025, Npgsql
+
+    Permission to use, copy, modify, and distribute this software and its
+    documentation for any purpose, without fee, and without a written agreement
+    is hereby granted, provided that the above copyright notice and this
+    paragraph and the following two paragraphs appear in all copies.
+
+    IN NO EVENT SHALL NPGSQL BE LIABLE TO ANY PARTY FOR DIRECT, INDIRECT,
+    SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST PROFITS,
+    ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF
+    Npgsql HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+    NPGSQL SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT LIMITED
+    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS" BASIS, AND Npgsql
+    HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS,
+    OR MODIFICATIONS.
+
+================================================================================
+2. Dapper (API design lineage only - no code incorporated)
+================================================================================
+
+Project:      Dapper
+Source:       https://github.com/DapperLib/Dapper
+Copyright:    Copyright (c) Sam Saffron, Marc Gravell, Nick Craver, and Dapper
+              contributors / Stack Exchange, Inc.
+License:      Apache License, Version 2.0
+
+The object-mapping API of this repository (the PgSqlMapper extension methods:
+Query / Query<T> / QueryFirst / QueryFirstOrDefault / QuerySingle /
+QuerySingleOrDefault / Execute / ExecuteScalar / ExecuteReader /
+QueryMultiple and their async forms, plus the grid-reader concept,
+anonymous-object parameters, unreferenced-parameter filtering and IN-list
+expansion) is modeled on the public API surface and observable behavior of
+Dapper, by way of the same API in the sibling CodeBrix.Sqlite library. The
+implementation in this repository was written fresh and PostgreSQL-specific
+(reflection-based materialization against the PgSql types in this library)
+rather than ported from Dapper's source, so no Dapper source file, and no
+fragment of one, is included; this entry records the API-design lineage only,
+and the code in this repository is licensed solely under the PostgreSQL
+License.
+
+================================================================================
+
+END OF THIRD-PARTY SOFTWARE NOTICES AND INFORMATION

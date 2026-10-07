@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The Roslyn source generator for CodeBrix.PostgresClient.
+
+    This project is NOT optional: it emits the keyword-dispatch half of
+    PgSqlConnectionStringBuilder (PgSqlConnectionStringBuilder.Generated.cs), which
+    src/CodeBrix.PostgresClient cannot compile without. It is a build-time tool only - it is
+    referenced as an analyzer with ReferenceOutputAssembly=false and is NOT shipped in the
+    NuGet package.
+
+    netstandard2.0 is mandatory here and is the family-sanctioned exception to net10-only: a
+    Roslyn generator is loaded by the compiler/IDE host, and those hosts load netstandard2.0
+    assemblies. LangVersion latest is set for the same reason - netstandard2.0 otherwise
+    defaults to C# 7.3, and the generator source is modern C#.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="5.9.0" PrivateAssets="all" />
+    <!-- The template engine the generator renders PgSqlConnectionStringBuilder.snbtxt with.
+         GeneratePathProperty exposes $(PKGCodeBrix_Templating_BsdLicenseForever) so the target
+         below can hand the netstandard2.0 assembly to the compiler host alongside the generator:
+         an analyzer's own package dependencies are NOT resolved by the host automatically. -->
+    <PackageReference Include="CodeBrix.Templating.BsdLicenseForever" Version="1.0.279.24" GeneratePathProperty="true" PrivateAssets="all" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <GetTargetPathDependsOn>$(GetTargetPathDependsOn);GetDependencyTargetPaths</GetTargetPathDependsOn>
+  </PropertyGroup>
+
+  <Target Name="GetDependencyTargetPaths">
+    <ItemGroup>
+      <TargetPathWithTargetPlatformMoniker Include="$(PKGCodeBrix_Templating_BsdLicenseForever)\lib\netstandard2.0\CodeBrix.Templating.dll" IncludeRuntimeDependency="false" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
+    <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
+    <EmbeddedResource Include="PgSqlConnectionStringBuilder.snbtxt" />
+  </ItemGroup>
+
+</Project>
