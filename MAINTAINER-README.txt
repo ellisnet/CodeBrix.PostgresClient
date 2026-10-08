@@ -196,6 +196,17 @@ never touch the database never start it.
     * To run against an existing server instead, set PGSQL_TEST_DB to its
       connection string (the server must be configured as above for the full
       suite to pass). No container is started then.
+    * The suite connects to the container at 127.0.0.1, never "localhost". On
+      Docker Desktop with WSL2, localhost resolves to ::1 first, and
+      [::1]:<port> belongs to WSL's wslrelay.exe rather than Docker's own
+      forwarder; that relay stalls when bulk data flows both ways at once
+      (a batch streaming a big parameter while results stream back), which
+      hangs tests forever under Command Timeout=0. Use 127.0.0.1 in
+      PGSQL_TEST_DB too. Tests that need the server certificate's host name
+      (CN=localhost, for VerifyFull) set Host=localhost themselves.
+    * TestDatabase starts the container via Task.Run, because the first test
+      to read the connection string may be running under a single-threaded
+      SynchronizationContext and blocks on the start-up task.
     * Tests that the container cannot support - Unix-domain-socket connections
       to the server, Kerberos/GSSAPI/SSPI, Windows-only behaviour - are
       skipped with a specific reason. Upstream's [Explicit] tests are

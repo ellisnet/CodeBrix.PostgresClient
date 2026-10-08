@@ -43,7 +43,10 @@ public static class TestDatabase
     const string PidLabel = "codebrix.postgresclient.tests.pid";
     const string HostLabel = "codebrix.postgresclient.tests.host";
 
-    static readonly Lazy<Task<string>> Started = new(StartAsync, LazyThreadSafetyMode.ExecutionAndPublication);
+    // Task.Run: ConnectionString blocks on this task, and the first reader may be a test running under a
+    // single-threaded SynchronizationContext (BugTests.ui_thread_synchronization_context_deadlock). Starting
+    // on the thread pool keeps StartAsync's continuations off that context, so blocking on it cannot deadlock.
+    static readonly Lazy<Task<string>> Started = new(() => Task.Run(StartAsync), LazyThreadSafetyMode.ExecutionAndPublication);
     static readonly object StopLock = new();
     static string _containerId;
     static bool _stopped;
@@ -114,8 +117,14 @@ public static class TestDatabase
                     $"Last container log lines:{Environment.NewLine}{logs.Combined}", e);
             }
 
+            // 127.0.0.1, not localhost: on Docker Desktop with WSL2, localhost resolves to ::1 first, and
+            // [::1]:<port> is claimed by WSL's wslrelay.exe rather than Docker's own forwarder. That relay
+            // stalls when large amounts of data flow in both directions at once (as when a batch streams a
+            // big parameter while PostgreSQL streams back the results of an earlier statement), which hangs
+            // tests forever under Command Timeout=0. Tests that need the certificate's host name (CN=localhost)
+            // set Host=localhost themselves.
             var connectionString =
-                $"Host=localhost;Port={hostPort};Username={TestUser};Password={TestUser};Database={TestUser};" +
+                $"Host=127.0.0.1;Port={hostPort};Username={TestUser};Password={TestUser};Database={TestUser};" +
                 "Timeout=0;Command Timeout=0;SSL Mode=Disable;Multiplexing=False";
             await WaitUntilConnectableAsync(connectionString, ct);
             return connectionString;

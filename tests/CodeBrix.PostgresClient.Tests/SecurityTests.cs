@@ -631,6 +631,7 @@ public class SecurityTests : TestBase, IClassFixture<SecurityTestsFixture>
 
         await using var dataSource = CreateDataSource(csb =>
         {
+            csb.Host = "localhost"; // the server certificate's CN, which VerifyFull checks
             csb.SslMode = sslMode;
             csb.RootCertificate = SecurityTestsFixture.CaCertificatePath;
         });
@@ -698,6 +699,7 @@ public class SecurityTests : TestBase, IClassFixture<SecurityTestsFixture>
         }
 
         var dataSourceBuilder = CreateDataSourceBuilder();
+        dataSourceBuilder.ConnectionStringBuilder.Host = "localhost"; // the server certificate's CN, which VerifyFull checks
         dataSourceBuilder.ConnectionStringBuilder.SslMode = sslMode;
         dataSourceBuilder.UseRootCertificates(certificates);
 
